@@ -1,21 +1,12 @@
-class Board{
-
-    public char gameBoard[];
-
-    Board(){
-        this.gameBoard=new char[10];
-    }
-    
-    public void initilizeBoardElements(){
-        for(int i=1;i<10;i++){
-            this.gameBoard[i]=" ".charAt(0);
-        }
-    }
-}
 public class TicTacToe{
     public static void main(String[] args) {
+        //welcome message
         System.out.println("welcome to tictactoe game");
+
+        //creating Board object
         Board b=new Board();
+
+        //initilizing board elements with space
         b.initilizeBoardElements();
     }
 }
