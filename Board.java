@@ -10,8 +10,13 @@ public class Board{
     //function to initilize and set gameboard
     public void initilizeBoardElements(){
         for(int i=1;i<gameBoard.length;i++){
-            this.gameBoard[i]=" ".charAt(0);
-            System.out.println("haii");
+            this.gameBoard[i]="_".charAt(0);
         }
+    }
+    public void displayBoard(){
+        System.out.println("\n\t"+this.gameBoard[1]+" "+this.gameBoard[2]+" "+this.gameBoard[3]);
+        System.out.println("\t"+this.gameBoard[4]+" "+this.gameBoard[5]+" "+this.gameBoard[6]);
+        System.out.println("\t"+this.gameBoard[7]+" "+this.gameBoard[8]+" "+this.gameBoard[9]);
+        System.out.println("\n---------------------");
     }
 }

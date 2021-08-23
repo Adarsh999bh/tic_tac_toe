@@ -1,7 +1,7 @@
 import java.util.Scanner;
 public class TicTacToe{
-    private static void setPlayerAattributes(Player user,Player computer){
-
+    private static Player[] setPlayerAattributes(){
+        Player[] p=new Player[2];
         //ask for user inputs
         Scanner sc=new Scanner(System.in);
         System.out.print("Enter player name : ");
@@ -11,13 +11,14 @@ public class TicTacToe{
         sc.close();
 
         // creating Player Object (one for real player and one for computer)
-        user=new Player(choice, name);
+        p[0]=new Player(choice, name);
         if(choice=='X'){
-            computer=new Player('O', "Computer");// if user has choosen x
+            p[1]=new Player('O', "Computer");// if user has choosen x
         }
         else{
-            computer=new Player('X', "Computer");// if user has choosen y
+            p[1]=new Player('X', "Computer");// if user has choosen y
         }
+        return p;
     }
     public static void main(String[] args) {
         //welcome message
@@ -29,8 +30,12 @@ public class TicTacToe{
         //initilizing board elements with space
         boardObj.initilizeBoardElements();
         Player user=null, computer=null;
-        setPlayerAattributes(user, computer);
+        Player[] p=setPlayerAattributes();
+        user=p[0];
+        computer=p[1];
+        p=null;
         user.printPlayerDetails();
         computer.printPlayerDetails();
+        boardObj.displayBoard();
     }
 }
