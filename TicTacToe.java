@@ -1,6 +1,5 @@
 import java.util.Scanner;
 
-import javax.swing.text.Style;
 
 public class TicTacToe{
     private static Player[] setPlayerAattributes(){
@@ -23,9 +22,37 @@ public class TicTacToe{
         }
         return p;
     }
-    private static int findCriticalIndex(Board b,String allocatedIndexes, Player user){
-        
-        return 0;
+    private static int findMatch(String s1,String s2){
+        int noOfMatches=0;
+        for(int i=0;i<s1.length();i++){
+            for(int j=0;j<s2.length();j++){
+                if(s1.charAt(i)==s2.charAt(j)){
+                    noOfMatches+=1;
+                    break;
+                }
+            }
+        }
+        return noOfMatches;
+    }
+    private static int findCriticalIndex(Board b, Player user){
+        String[] winningCases=new String[]{"123","456","789","147","258","369","159","357"};
+        //int maxMatchIndex=0;
+        int noOfMatches=0;
+        for(int i=0;i<winningCases.length;i++){
+            noOfMatches=findMatch(user.allocatedIndices, winningCases[i]);
+            if(noOfMatches==2){
+                for(int j=0;j<3;j++){
+                    if(b.gameBoard[j]=='_')
+                        return (int) winningCases[i].charAt(j);
+                }
+            }
+
+        }
+        while(true){
+            int index=((int)(Math.random() * 9) + 1);
+            if(b.gameBoard[index]=='_')
+                return index;
+        }
     }
     private static int checkWinner(Board b){
         if(b.gameBoard[1]==b.gameBoard[2] && b.gameBoard[2]==b.gameBoard[3] && b.gameBoard[1]!='_' && b.gameBoard[2]!='_' && b.gameBoard[3]!='_'){
@@ -62,7 +89,7 @@ public class TicTacToe{
         if(p1.playerName.equals("Computer")){
             int index=((int)(Math.random() * 9) + 1);
             b.gameBoard[index]=p1.playerChoosenLetter;
-            String allocatedIndexes=""+index;
+            //String allocatedIndexes=""+index;
             System.out.println("Board after "+p1.playerName+" Played");
             b.displayBoard();
             int status=0;
@@ -70,7 +97,8 @@ public class TicTacToe{
                 System.out.println("enter the location for input");
                 index=sc.nextInt();
                 b.gameBoard[index]=p2.playerChoosenLetter;
-                allocatedIndexes+=""+index;
+                //allocatedIndexes+=""+index;
+                p2.allocatedIndices+=""+index;
                 System.out.println("Board after "+p2.playerName+" Played");
                 b.displayBoard();
                 status=checkWinner(b);
@@ -79,9 +107,11 @@ public class TicTacToe{
                     p2.playerWinningStreak+=1;
                     return p2;
                 }
-                index=findCriticalIndex(b,allocatedIndexes,p2);
+                //index=findCriticalIndex(b,allocatedIndexes,p2);
+                index=findCriticalIndex(b, p2);
                 b.gameBoard[index]=p1.playerChoosenLetter;
-                allocatedIndexes+=""+index;
+                //allocatedIndexes+=""+index;
+                p1.allocatedIndices+=""+index;
                 System.out.println("Board after "+p1.playerName+" Played");
                 b.displayBoard();
                 status=checkWinner(b);
@@ -98,26 +128,30 @@ public class TicTacToe{
             System.out.println("enter the location for input");
             int index=sc.nextInt();
             b.gameBoard[index]=p1.playerChoosenLetter;
-            String allocatedIndexes=""+index;
+            //String allocatedIndexes=""+index;
+            p1.allocatedIndices+=""+index;
             System.out.println("Board after "+p1.playerName+" Played");
             b.displayBoard();
             int status=0;
             while(i<b.gameBoard.length){ 
-                index=findCriticalIndex(b,allocatedIndexes,p1);
+                //index=findCriticalIndex(b,allocatedIndexes,p1);
+                index=findCriticalIndex(b, p1);
                 b.gameBoard[index]=p2.playerChoosenLetter;
-                allocatedIndexes+=""+index;
+                //allocatedIndexes+=""+index;
+                p2.allocatedIndices+=""+index;
                 System.out.println("Board after "+p2.playerName+" Played");
                 b.displayBoard();
                 status=checkWinner(b);
                 if(status==1){
                     p2.playerWinningStatus=1;
-                    p2.playerWinningStreak+=1
+                    p2.playerWinningStreak+=1;
                     return p2;
                 }
                 System.out.println("enter the location for input");
                 index=sc.nextInt();
                 b.gameBoard[index]=p1.playerChoosenLetter;
-                allocatedIndexes+=""+index;
+                //allocatedIndexes+=""+index;
+                p1.allocatedIndices+=""+index;
                 System.out.println("Board after "+p1.playerName+" Played");
                 b.displayBoard();
                 status=checkWinner(b);
@@ -128,8 +162,9 @@ public class TicTacToe{
                 }
                 i+=2;
             }
-            return p1;//default return
         }
+        sc.close();
+        return p1;//default return
     }
     public static void main(String[] args) {
         //welcome message
