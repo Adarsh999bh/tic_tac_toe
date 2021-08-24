@@ -2,12 +2,15 @@ import java.util.Scanner;
 
 
 public class TicTacToe{
+
+    //setting up Player attributes
     private static Player[] setPlayerAattributes(){
         Player[] p=new Player[2];
         //ask for user inputs
         Scanner sc=new Scanner(System.in);
         System.out.print("Enter player name : ");
         String name=sc.nextLine();
+        //asking Player to make a choice
         System.out.println("Enter player's choice X or O");
         char choice=sc.next().charAt(0);
         sc.close();
@@ -22,6 +25,8 @@ public class TicTacToe{
         }
         return p;
     }
+
+    //function to find the number of characters matching in the string
     private static int findMatch(String s1,String s2){
         int noOfMatches=0;
         for(int i=0;i<s1.length();i++){
@@ -34,12 +39,15 @@ public class TicTacToe{
         }
         return noOfMatches;
     }
+
+    //function to find the critical index to block user from winning
     private static int findCriticalIndex(Board b, Player user){
         String[] winningCases=new String[]{"123","456","789","147","258","369","159","357"};
         //int maxMatchIndex=0;
         int noOfMatches=0;
         for(int i=0;i<winningCases.length;i++){
             noOfMatches=findMatch(user.allocatedIndices, winningCases[i]);
+            //Crritical only if the match is greter than 2
             if(noOfMatches==2){
                 for(int j=0;j<3;j++){
                     if(b.gameBoard[j]=='_')
@@ -48,12 +56,15 @@ public class TicTacToe{
             }
 
         }
+        //if match leess than 1 return randomnly a index whose input is not set already
         while(true){
             int index=((int)(Math.random() * 9) + 1);
             if(b.gameBoard[index]=='_')
                 return index;
         }
     }
+
+    //function to check winner return 1 if won else 0
     private static int checkWinner(Board b){
         if(b.gameBoard[1]==b.gameBoard[2] && b.gameBoard[2]==b.gameBoard[3] && b.gameBoard[1]!='_' && b.gameBoard[2]!='_' && b.gameBoard[3]!='_'){
             return 1;
@@ -83,6 +94,8 @@ public class TicTacToe{
             return 0;
         }
     }
+
+    //Playing function to play the game
     private static Player startPlaying(Player p1,Player p2,Board b){
         int i=1;
         Scanner sc=new Scanner(System.in);
@@ -101,6 +114,7 @@ public class TicTacToe{
                 p2.allocatedIndices+=""+index;
                 System.out.println("Board after "+p2.playerName+" Played");
                 b.displayBoard();
+                //check if the player has won
                 status=checkWinner(b);
                 if(status==1){
                     p2.playerWinningStatus=1;
@@ -114,6 +128,8 @@ public class TicTacToe{
                 p1.allocatedIndices+=""+index;
                 System.out.println("Board after "+p1.playerName+" Played");
                 b.displayBoard();
+
+                //check if the player has won
                 status=checkWinner(b);
                 if(status==1){
                     p1.playerWinningStatus=1;
@@ -203,12 +219,15 @@ public class TicTacToe{
                 System.out.println("Winning Stats");
                 System.out.println(user.playerName+" : "+user.playerWinningStreak);
                 System.out.println(computer.playerName+" : "+computer.playerWinningStreak);
+
+                //asking if the player wants to play again
                 System.out.println("\nWant to play again.? (yes or no)");
                 s=sc.nextLine();
                 if(s.equals("no")){
-                    System.exit(0);
+                    System.exit(0);//if no then Quit
                 }
                 else{
+                    //Create a new game
                     System.out.println("New game");
                     boardObj.initilizeBoardElements();
                     user.playerWinningStatus=0;
@@ -216,6 +235,7 @@ public class TicTacToe{
                 }
             }
             else{
+                //print if nobody won
                 System.out.println("Oops.! its a tie");
                 System.out.println("Want to play again.? (yes or no)");
                 s=sc.nextLine();
