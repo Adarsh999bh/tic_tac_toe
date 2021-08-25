@@ -3,13 +3,9 @@ import java.util.Scanner;
 
 public class TicTacToe{
 
-<<<<<<< HEAD
-    //setting up Player attributes
-=======
     static Scanner sc=new Scanner(System.in);
 
 
->>>>>>> UC9
     private static Player[] setPlayerAattributes(){
 
 
