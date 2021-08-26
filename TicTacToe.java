@@ -13,7 +13,7 @@ public class TicTacToe{
         //ask for user inputs
         System.out.print("Enter player name : ");
         String name=sc.nextLine();
-        System.out.println("Enter player's choice X or O");
+        System.out.print("Enter player's choice X or O : ");
         char choice=sc.next().charAt(0);
         sc.nextLine();
 
@@ -44,6 +44,25 @@ public class TicTacToe{
             }
         }
         return noOfMatches;
+    }
+    private static int winningPosition(Board b, Player computer){
+
+        String[] winningCases=new String[]{"123","456","789","147","258","369","159","357"};
+        int noOfMatches=0;
+
+        for(int i=0;i<winningCases.length;i++){
+            noOfMatches=findMatch(computer.allocatedIndices, winningCases[i]);
+            if(noOfMatches==2){
+                for(int j=0;j<3;j++){
+                    int index= Character.getNumericValue(winningCases[i].charAt(j));
+                    if(b.gameBoard[index]=='_')
+                        return index;
+                }
+            }
+
+        }
+        return -1;
+
     }
     
     //function to find critical index
@@ -139,6 +158,7 @@ public class TicTacToe{
 
             int index=((int)(Math.random() * 9) + 1);//setting index randomnly for first time
             b.gameBoard[index]=p1.playerChoosenLetter;
+            p1.allocatedIndices+=""+index;
 
             System.out.println("Board after "+p1.playerName+" Played");
             b.displayBoard();
@@ -172,7 +192,11 @@ public class TicTacToe{
                 }
 
 
-                index=findCriticalIndex(b, p2);
+                //index=findCriticalIndex(b, p2);
+                index=winningPosition(b, p2);
+                if(index==-1){
+                    index=findCriticalIndex(b, p1);
+                }
                 b.gameBoard[index]=p1.playerChoosenLetter;
                 p1.allocatedIndices+=""+index;
 
@@ -224,7 +248,11 @@ public class TicTacToe{
             while(i<b.gameBoard.length){ 
 
                 //finding critical index before making move
-                index=findCriticalIndex(b, p1);
+                //index=findCriticalIndex(b, p1);
+                index=winningPosition(b, p2);
+                if(index==-1){
+                    index=findCriticalIndex(b, p1);
+                }
                 b.gameBoard[index]=p2.playerChoosenLetter;
 
                 p2.allocatedIndices+=""+index;
