@@ -1,0 +1,861 @@
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use common::cpu::CpuPermit;
+use itertools::Itertools;
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use segment::common::operation_error::check_process_stopped;
+use segment::common::operation_time_statistics::{
+    OperationDurationsAggregator, ScopeDurationMeasurer,
+};
+use segment::common::version::StorageVersion;
+use segment::entry::entry_point::SegmentEntry;
+use segment::id_tracker::IdTracker;
+use segment::index::sparse_index::sparse_index_config::SparseIndexType;
+use segment::segment::{Segment, SegmentVersion};
+use segment::segment_constructor::build_segment;
+use segment::segment_constructor::copy_segment;
+use segment::segment_constructor::load_segment;
+use segment::segment_constructor::segment_builder::SegmentBuilder;
+use segment::types::{
+    HnswConfig, Indexes, PayloadFieldSchema, PayloadKeyType, PayloadStorageType, PointIdType,
+    QuantizationConfig, SegmentConfig, SegmentType, VectorStorageType, VECTOR_ELEMENT_SIZE,
+};
+
+use crate::collection_manager::holders::proxy_segment::ProxySegment;
+use crate::collection_manager::holders::segment_holder::{
+    LockedSegment, LockedSegmentHolder, SegmentId,
+};
+use crate::config::CollectionParams;
+use crate::operations::config_diff::DiffConfig;
+use crate::operations::types::{CollectionError, CollectionResult};
+
+const BYTES_IN_KB: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct OptimizerThresholds {
+    pub max_segment_size: usize,
+    pub memmap_threshold: usize,
+    pub indexing_threshold: usize,
+}
+
+/// SegmentOptimizer - trait implementing common functionality of the optimizers
+///
+/// It provides functions which allow to re-build specified segments into a new, better one.
+/// Process allows read and write (with some tricks) access to the optimized segments.
+///
+/// Process of the optimization is same for all optimizers.
+/// The selection of the candidates for optimization and the configuration
+/// of resulting segment are up to concrete implementations.
+pub trait SegmentOptimizer {
+    /// Get name describing this optimizer
+    fn name(&self) -> &str;
+
+    /// Get path of the whole collection
+    fn collection_path(&self) -> &Path;
+
+    /// Get temp path, where optimized segments could be temporary stored
+    fn temp_path(&self) -> &Path;
+
+    /// Get basic segment config
+    fn collection_params(&self) -> CollectionParams;
+
+    /// Get HNSW config
+    fn hnsw_config(&self) -> &HnswConfig;
+
+    /// Get quantization config
+    fn quantization_config(&self) -> Option<QuantizationConfig>;
+
+    /// Get thresholds configuration for the current optimizer
+    fn threshold_config(&self) -> &OptimizerThresholds;
+
+    /// Checks if segment optimization is required
+    fn check_condition(
+        &self,
+        segments: LockedSegmentHolder,
+        excluded_ids: &HashSet<SegmentId>,
+    ) -> Vec<SegmentId>;
+
+    fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator>;
+
+    /// Build temp segment
+    fn temp_segment(&self, save_version: bool) -> CollectionResult<LockedSegment> {
+        let collection_params = self.collection_params();
+        let config = SegmentConfig {
+            vector_data: collection_params.into_base_vector_data()?,
+            sparse_vector_data: collection_params.into_sparse_vector_data()?,
+            payload_storage_type: if collection_params.on_disk_payload {
+                PayloadStorageType::OnDisk
+            } else {
+                PayloadStorageType::InMemory
+            },
+        };
+        Ok(LockedSegment::new(build_segment(
+            self.collection_path(),
+            &config,
+            save_version,
+        )?))
+    }
+
+    /// Build optimized segment
+    fn optimized_segment_builder(
+        &self,
+        optimizing_segments: &[LockedSegment],
+    ) -> CollectionResult<SegmentBuilder> {
+        // Example:
+        //
+        // S1: {
+        //     text_vectors: 10000,
+        //     image_vectors: 100
+        // }
+        // S2: {
+        //     text_vectors: 200,
+        //     image_vectors: 10000
+        // }
+
+        // Example: bytes_count_by_vector_name = {
+        //     text_vectors: 10200 * dim * VECTOR_ELEMENT_SIZE
+        //     image_vectors: 10100 * dim * VECTOR_ELEMENT_SIZE
+        // }
+        let mut bytes_count_by_vector_name = HashMap::new();
+
+        for segment in optimizing_segments {
+            let segment = match segment {
+                LockedSegment::Original(segment) => segment,
+                LockedSegment::Proxy(_) => {
+                    return Err(CollectionError::service_error(
+                        "Proxy segment is not expected here".to_string(),
+                    ))
+                }
+            };
+            let locked_segment = segment.read();
+
+            for (vector_name, dim) in locked_segment.vector_dims() {
+                let available_vectors =
+                    locked_segment.available_vector_count(&vector_name).unwrap();
+                let vector_size = dim * VECTOR_ELEMENT_SIZE * available_vectors;
+                let size = bytes_count_by_vector_name.entry(vector_name).or_insert(0);
+                *size += vector_size;
+            }
+        }
+
+        // Example: maximal_vector_store_size_bytes = 10200 * dim * VECTOR_ELEMENT_SIZE
+        let maximal_vector_store_size_bytes = bytes_count_by_vector_name
+            .values()
+            .max()
+            .copied()
+            .unwrap_or(0);
+
+        let thresholds = self.threshold_config();
+        let collection_params = self.collection_params();
+
+        let threshold_is_indexed = maximal_vector_store_size_bytes
+            >= thresholds.indexing_threshold.saturating_mul(BYTES_IN_KB);
+
+        let threshold_is_on_disk = maximal_vector_store_size_bytes
+            >= thresholds.memmap_threshold.saturating_mul(BYTES_IN_KB);
+
+        let mut vector_data = collection_params.into_base_vector_data()?;
+        let mut sparse_vector_data = collection_params.into_sparse_vector_data()?;
+
+        // If indexing, change to HNSW index and quantization
+        if threshold_is_indexed {
+            let collection_hnsw = self.hnsw_config();
+            let collection_quantization = self.quantization_config();
+            vector_data.iter_mut().for_each(|(vector_name, config)| {
+                // Assign HNSW index
+                let param_hnsw = collection_params
+                    .vectors
+                    .get_params(vector_name)
+                    .and_then(|params| params.hnsw_config);
+                let vector_hnsw = param_hnsw
+                    .and_then(|c| c.update(collection_hnsw).ok())
+                    .unwrap_or_else(|| collection_hnsw.clone());
+                config.index = Indexes::Hnsw(vector_hnsw);
+
+                // Assign quantization config
+                let param_quantization = collection_params
+                    .vectors
+                    .get_params(vector_name)
+                    .and_then(|params| params.quantization_config.as_ref());
+                let vector_quantization = param_quantization
+                    .or(collection_quantization.as_ref())
+                    .cloned();
+                config.quantization_config = vector_quantization;
+            });
+        }
+
+        // If storing on disk, set storage type in current segment (not in collection config)
+        if threshold_is_on_disk {
+            vector_data.iter_mut().for_each(|(vector_name, config)| {
+                // Check whether on_disk is explicitly configured, if not, set it to true
+                let config_on_disk = collection_params
+                    .vectors
+                    .get_params(vector_name)
+                    .and_then(|config| config.on_disk);
+
+                match config_on_disk {
+                    Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
+                    Some(false) => {}, // on_disk=false wins, do nothing
+                    None => config.storage_type = VectorStorageType::Mmap, // Mmap threshold wins
+                }
+
+                // If we explicitly configure on_disk, but the segment storage type uses something
+                // that doesn't match, warn about it
+                if let Some(config_on_disk) = config_on_disk {
+                    if config_on_disk != config.storage_type.is_on_disk() {
+                        log::warn!("Collection config for vector {vector_name} has on_disk={config_on_disk:?} configured, but storage type for segment doesn't match it");
+                    }
+                }
+            });
+        }
+
+        sparse_vector_data
+            .iter_mut()
+            .for_each(|(vector_name, config)| {
+                // Assign sparse index on disk
+                if let Some(sparse_config) = &collection_params.sparse_vectors {
+                    if let Some(params) = sparse_config.get(vector_name) {
+                        let config_on_disk = params
+                            .index
+                            .and_then(|index_params| index_params.on_disk)
+                            .unwrap_or(threshold_is_on_disk);
+
+                        // If mmap OR index is exceeded
+                        let is_big = threshold_is_on_disk || threshold_is_indexed;
+
+                        let index_type = match (is_big, config_on_disk) {
+                            (true, true) => SparseIndexType::Mmap, // Big and configured on disk
+                            (true, false) => SparseIndexType::ImmutableRam, // Big and not on disk nor reached threshold
+                            (false, _) => SparseIndexType::MutableRam,      // Small
+                        };
+
+                        config.index.index_type = index_type;
+                    }
+                }
+            });
+
+        let optimized_config = SegmentConfig {
+            vector_data,
+            sparse_vector_data,
+            payload_storage_type: if collection_params.on_disk_payload {
+                PayloadStorageType::OnDisk
+            } else {
+                PayloadStorageType::InMemory
+            },
+        };
+
+        Ok(SegmentBuilder::new(
+            self.collection_path(),
+            self.temp_path(),
+            &optimized_config,
+        )?)
+    }
+
+    /// Restores original segments from proxies
+    ///
+    /// # Arguments
+    ///
+    /// * `segments` - segment holder
+    /// * `proxy_ids` - ids of poxy-wrapped segment to restore
+    ///
+    /// # Result
+    ///
+    /// Original segments are pushed into `segments`, proxies removed.
+    /// Returns IDs on restored segments
+    ///
+    fn unwrap_proxy(
+        &self,
+        segments: &LockedSegmentHolder,
+        proxy_ids: &[SegmentId],
+    ) -> Vec<SegmentId> {
+        let mut segments_lock = segments.write();
+        let mut restored_segment_ids = vec![];
+        for &proxy_id in proxy_ids {
+            if let Some(proxy_segment_ref) = segments_lock.get(proxy_id) {
+                let locked_proxy_segment = proxy_segment_ref.clone();
+                match locked_proxy_segment {
+                    LockedSegment::Original(_) => {
+                        /* Already unwrapped. It should not actually be here */
+                        log::warn!("Attempt to unwrap raw segment! Should not happen.")
+                    }
+                    LockedSegment::Proxy(proxy_segment) => {
+                        let wrapped_segment = proxy_segment.read().wrapped_segment.clone();
+                        let (restored_id, _proxies) =
+                            segments_lock.swap(wrapped_segment, &[proxy_id]);
+                        restored_segment_ids.push(restored_id);
+                    }
+                }
+            }
+        }
+        restored_segment_ids
+    }
+
+    /// Checks if optimization cancellation is requested.
+    fn check_cancellation(&self, stopped: &AtomicBool) -> CollectionResult<()> {
+        if stopped.load(Ordering::Relaxed) {
+            return Err(CollectionError::Cancelled {
+                description: "optimization cancelled by service".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Unwraps proxy, adds temp segment into collection and returns a `Cancelled` error.
+    ///
+    /// # Arguments
+    ///
+    /// * `segments` - all registered segments of the collection
+    /// * `proxy_ids` - currently used proxies
+    /// * `temp_segment` - currently used temporary segment
+    ///
+    /// # Result
+    ///
+    /// Rolls back optimization state.
+    /// All processed changes will still be there, but the collection should be returned into state
+    /// before optimization.
+    fn handle_cancellation(
+        &self,
+        segments: &LockedSegmentHolder,
+        proxy_ids: &[SegmentId],
+        temp_segment: &LockedSegment,
+    ) {
+        self.unwrap_proxy(segments, proxy_ids);
+        if temp_segment.get().read().available_point_count() > 0 {
+            let mut write_segments = segments.write();
+            write_segments.add_locked(temp_segment.clone());
+        }
+    }
+
+    /// Attempt a true incremental HNSW update.
+    ///
+    /// Conditions for the incremental path:
+    /// - Exactly one indexed HNSW segment in `optimizing_segments`
+    /// - At least one appendable (Plain) segment
+    /// - New vectors < 25% of existing indexed vectors
+    ///
+    /// When conditions are met:
+    /// 1. Copy the indexed segment directory (preserves existing HNSW graph)
+    /// 2. Write new vectors directly into the copied segment's storage and
+    ///    register them as pending via `update_vector`
+    /// 3. Call `flush_pending` to link only the new vectors into the graph
+    ///
+    /// Returns `None` when conditions are not met — full rebuild runs instead.
+    fn try_incremental_build(
+        &self,
+        optimizing_segments: &[LockedSegment],
+        proxy_deleted_points: Arc<RwLock<HashSet<PointIdType>>>,
+        proxy_deleted_indexes: Arc<RwLock<HashSet<PayloadKeyType>>>,
+        proxy_created_indexes: Arc<RwLock<HashMap<PayloadKeyType, PayloadFieldSchema>>>,
+        stopped: &AtomicBool,
+    ) -> CollectionResult<Option<Segment>> {
+        // ── 1. Classify segments ──────────────────────────────────────────
+        let mut indexed_segment: Option<&LockedSegment> = None;
+        let mut appendable_segments: Vec<&LockedSegment> = Vec::new();
+
+        for seg in optimizing_segments {
+            match seg {
+                LockedSegment::Original(arc) => {
+                    let guard = arc.read();
+                    if guard.segment_type() == SegmentType::Indexed {
+                        if indexed_segment.is_some() {
+                            return Ok(None); // >1 indexed → full rebuild
+                        }
+                        indexed_segment = Some(seg);
+                    } else {
+                        appendable_segments.push(seg);
+                    }
+                }
+                LockedSegment::Proxy(_) => return Ok(None),
+            }
+        }
+
+        let indexed_seg = match indexed_segment {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if appendable_segments.is_empty() {
+            return Ok(None);
+        }
+
+        // ── 2. Count vectors ──────────────────────────────────────────────
+        let existing_count = match indexed_seg {
+            LockedSegment::Original(arc) => arc.read().available_point_count(),
+            LockedSegment::Proxy(_) => return Ok(None),
+        };
+        let new_count: usize = appendable_segments
+            .iter()
+            .map(|s| match s {
+                LockedSegment::Original(arc) => arc.read().available_point_count(),
+                LockedSegment::Proxy(_) => 0,
+            })
+            .sum();
+
+        if new_count == 0 || new_count >= existing_count / 4 {
+            log::debug!(
+                "Incremental HNSW skipped: existing={existing_count} new={new_count} (>=25%)"
+            );
+            return Ok(None);
+        }
+
+        log::info!(
+            "Incremental HNSW: {existing_count} existing + {new_count} new vectors"
+        );
+
+        // ── 3. Copy indexed segment (preserves HNSW graph on disk) ────────
+        let src_path = match indexed_seg {
+            LockedSegment::Original(arc) => arc.read().current_path.clone(),
+            LockedSegment::Proxy(_) => return Ok(None),
+        };
+
+        let mut segment = copy_segment(&src_path, self.temp_path(), stopped)
+            .map_err(|e| CollectionError::service_error(format!("copy_segment failed: {e}")))?;
+
+        // ── 4. Insert new vectors into copied segment ──────────────────────
+        //
+        // Cannot use upsert_point() — HNSW segments have appendable_flag=false.
+        // Write to storage components directly. One loop assigns the SAME
+        // new_internal_id to both storage and id_tracker, keeping them in sync.
+        for app_seg in &appendable_segments {
+            check_process_stopped(stopped)?;
+
+            let app_guard = match app_seg {
+                LockedSegment::Original(arc) => arc.read(),
+                LockedSegment::Proxy(_) => continue,
+            };
+
+            let app_id_tracker = app_guard.id_tracker.borrow();
+            let app_payload    = app_guard.payload_index.borrow();
+
+            let mut seg_id_tracker = segment.id_tracker.borrow_mut();
+            let mut seg_payload    = segment.payload_index.borrow_mut();
+
+            for internal_id in app_id_tracker.iter_ids() {
+                check_process_stopped(stopped)?;
+
+                let external_id = match app_id_tracker.external_id(internal_id) {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                if proxy_deleted_points.read().contains(&external_id) {
+                    continue;
+                }
+
+                // Skip if already present (handles duplicates across segments)
+                if seg_id_tracker.internal_id(external_id).is_some() {
+                    continue;
+                }
+
+                // Derive new_internal_id from total_point_count BEFORE inserting.
+                // This is the same value that storage will use, keeping them in sync.
+                let new_internal_id = seg_id_tracker.total_point_count() as PointOffsetType;
+
+                let version = app_id_tracker.internal_version(internal_id).unwrap_or(0);
+                seg_id_tracker.set_link(external_id, new_internal_id)?;
+                seg_id_tracker.set_internal_version(new_internal_id, version)?;
+
+                let payload = app_payload.payload(internal_id)?;
+                if !payload.is_empty() {
+                    seg_payload.assign(new_internal_id, &payload, &None)?;
+                }
+
+                // Write vector and register as pending for each vector name
+                for (vector_name, app_vector_data) in &app_guard.vector_data {
+                    let app_storage = app_vector_data.vector_storage.borrow();
+                    let seg_vector_data = match segment.vector_data.get(vector_name) {
+                        Some(vd) => vd,
+                        None => continue,
+                    };
+                    let mut seg_storage = seg_vector_data.vector_storage.borrow_mut();
+                    let mut seg_index   = seg_vector_data.vector_index.borrow_mut();
+
+                    let vector = app_storage.get_vector(internal_id);
+                    seg_storage.insert_vector(new_internal_id, vector.as_vec_ref())?;
+                    seg_index.update_vector(new_internal_id, vector.as_vec_ref())?;
+                }
+            }
+        }
+
+        // ── 5. Flush pending into existing HNSW graph ─────────────────────
+        for (vector_name, vector_data) in &segment.vector_data {
+            check_process_stopped(stopped)?;
+            let mut index = vector_data.vector_index.borrow_mut();
+            let pending = index.pending_vector_count();
+            if pending > 0 {
+                log::info!(
+                    "Incremental HNSW flush_pending: {pending} vectors for '{vector_name}'"
+                );
+                index.flush_pending(stopped)?;
+            }
+        }
+
+        // ── 6. Apply schema changes and deletions ──────────────────────────
+        for field in proxy_deleted_indexes.read().iter() {
+            segment.delete_field_index(segment.version(), field)?;
+        }
+        for (field, schema) in proxy_created_indexes.read().iter() {
+            segment.create_field_index(segment.version(), field, Some(schema))?;
+        }
+        for &point_id in proxy_deleted_points.read().iter() {
+            let _ = segment.delete_point(segment.version(), point_id);
+        }
+
+        // ── 7. Flush + rename + reload ────────────────────────────────────
+        //
+        // These three steps are critical for correctness and match what
+        // segment_builder::build() does for the full-rebuild path.
+        //
+        // WITHOUT flush:
+        //   flush_pending saves the HNSW graph, but id_tracker and payload
+        //   changes from step 4 are only in RocksDB write buffers. If a
+        //   subsequent optimizer task copies this segment's directory before
+        //   the buffers are flushed, the copy has a stale id_tracker that
+        //   is missing the new vectors' mappings. Those vectors exist in the
+        //   HNSW graph but are invisible to search — they are effectively lost.
+        //
+        // WITHOUT rename:
+        //   The segment lives in temp_path. It would not be found by
+        //   load_segment on restart (which only looks in the collection
+        //   segments directory).
+        //
+        // WITHOUT reload:
+        //   The in-memory segment's components may be in an inconsistent state
+        //   after direct low-level writes. A fresh load from disk guarantees
+        //   all components are consistent.
+
+        segment.flush(true).map_err(|e| {
+            CollectionError::service_error(format!("Incremental HNSW flush failed: {e}"))
+        })?;
+
+        let segment_dir_name = segment
+            .current_path
+            .file_name()
+            .ok_or_else(|| {
+                CollectionError::service_error("Invalid incremental segment path".to_string())
+            })?
+            .to_owned();
+        let dst = self.collection_path().join(&segment_dir_name);
+
+        std::fs::rename(&segment.current_path, &dst).map_err(|e| {
+            CollectionError::service_error(format!(
+                "Failed to move incremental segment to collection path: {e}"
+            ))
+        })?;
+
+        drop(segment);
+
+        let reloaded = load_segment(&dst, stopped)
+            .map_err(|e| {
+                CollectionError::service_error(format!("Incremental segment reload failed: {e}"))
+            })?
+            .ok_or_else(|| {
+                CollectionError::service_error(
+                    "Incremental HNSW segment not found after reload".to_string(),
+                )
+            })?;
+
+        log::info!(
+            "Incremental HNSW complete: {} total vectors",
+            reloaded.available_point_count()
+        );
+
+        Ok(Some(reloaded))
+    }
+
+    fn build_new_segment(
+        &self,
+        optimizing_segments: &[LockedSegment],
+        proxy_deleted_points: Arc<RwLock<HashSet<PointIdType>>>,
+        proxy_deleted_indexes: Arc<RwLock<HashSet<PayloadKeyType>>>,
+        proxy_created_indexes: Arc<RwLock<HashMap<PayloadKeyType, PayloadFieldSchema>>>,
+        permit: CpuPermit,
+        stopped: &AtomicBool,
+    ) -> CollectionResult<Segment> {
+        // ── Try incremental path first ────────────────────────────────────
+        if let Some(segment) = self.try_incremental_build(
+            optimizing_segments,
+            proxy_deleted_points.clone(),
+            proxy_deleted_indexes.clone(),
+            proxy_created_indexes.clone(),
+            stopped,
+        )? {
+            return Ok(segment);
+        }
+
+        // ── Fall back to full rebuild ─────────────────────────────────────
+        log::info!("HNSW full rebuild for {} segments", optimizing_segments.len());
+
+        let mut segment_builder = self.optimized_segment_builder(optimizing_segments)?;
+
+        self.check_cancellation(stopped)?;
+
+        for segment in optimizing_segments {
+            match segment {
+                LockedSegment::Original(segment_arc) => {
+                    let segment_guard = segment_arc.read();
+                    segment_builder.update_from(&segment_guard, stopped)?;
+                }
+                LockedSegment::Proxy(_) => panic!("Attempt to optimize segment which is already currently under optimization. Should never happen"),
+            }
+        }
+
+        for field in proxy_deleted_indexes.read().iter() {
+            segment_builder.indexed_fields.remove(field);
+        }
+        for (field, schema_type) in proxy_created_indexes.read().iter() {
+            segment_builder
+                .indexed_fields
+                .insert(field.to_owned(), schema_type.to_owned());
+        }
+
+        let mut optimized_segment: Segment = segment_builder.build(permit, stopped)?;
+
+        // Delete points in 2 steps
+        // First step - delete all points with read lock
+        // Second step - delete all the rest points with full write lock
+        //
+        // Use collection copy to prevent long time lock of `proxy_deleted_points`
+        let deleted_points_snapshot: Vec<PointIdType> =
+            proxy_deleted_points.read().iter().cloned().collect();
+
+        for &point_id in &deleted_points_snapshot {
+            optimized_segment
+                .delete_point(optimized_segment.version(), point_id)
+                .unwrap();
+        }
+
+        let deleted_indexes = proxy_deleted_indexes.read().iter().cloned().collect_vec();
+        let create_indexes = proxy_created_indexes.read().clone();
+
+        for delete_field_name in &deleted_indexes {
+            optimized_segment.delete_field_index(optimized_segment.version(), delete_field_name)?;
+            self.check_cancellation(stopped)?;
+        }
+
+        for (create_field_name, schema) in create_indexes {
+            optimized_segment.create_field_index(
+                optimized_segment.version(),
+                &create_field_name,
+                Some(&schema),
+            )?;
+            self.check_cancellation(stopped)?;
+        }
+
+        Ok(optimized_segment)
+    }
+
+    /// Performs optimization of collections's segments, including:
+    ///     - Segment rebuilding
+    ///     - Segment joining
+    ///
+    /// # Arguments
+    ///
+    /// * `segments` - segments holder
+    /// * `ids` - list of segment ids to perform optimization on. All segments will be merged into single one
+    /// * `stopped` - flag for early stopping of the optimization.
+    ///               If appears to be `true` - optimization process should be cancelled, all segments unwrapped
+    ///
+    /// # Result
+    ///
+    /// New optimized segment should be added into `segments`.
+    /// If there were any record changes during the optimization - an additional plain segment will be created.
+    ///
+    fn optimize(
+        &self,
+        segments: LockedSegmentHolder,
+        ids: Vec<SegmentId>,
+        permit: CpuPermit,
+        stopped: &AtomicBool,
+    ) -> CollectionResult<bool> {
+        check_process_stopped(stopped)?;
+
+        let mut timer = ScopeDurationMeasurer::new(self.get_telemetry_counter());
+        timer.set_success(false);
+
+        // On the one hand - we want to check consistently if all provided segments are
+        // available for optimization (not already under one) and we want to do it before creating a temp segment
+        // which is an expensive operation. So we can't not unlock `segments` after the check and before the insert.
+        //
+        // On the other hand - we do not want to hold write lock during the segment creation.
+        // Solution in the middle - is a upgradable lock. It ensures consistency after the check and allows to perform read operation.
+        let segment_lock = segments.upgradable_read();
+
+        let optimizing_segments: Vec<_> = ids
+            .iter()
+            .cloned()
+            .map(|id| segment_lock.get(id))
+            .filter_map(|x| x.cloned())
+            .collect();
+
+        // Check if all segments are not under other optimization or some ids are missing
+        let all_segments_ok = optimizing_segments.len() == ids.len()
+            && optimizing_segments
+                .iter()
+                .all(|s| matches!(s, LockedSegment::Original(_)));
+
+        if !all_segments_ok {
+            // Cancel the optimization
+            return Ok(false);
+        }
+
+        check_process_stopped(stopped)?;
+
+        let tmp_segment = self.temp_segment(false)?;
+
+        let proxy_deleted_points = Arc::new(RwLock::new(HashSet::<PointIdType>::new()));
+        let proxy_deleted_indexes = Arc::new(RwLock::new(HashSet::<PayloadKeyType>::new()));
+        let proxy_created_indexes = Arc::new(RwLock::new(HashMap::<
+            PayloadKeyType,
+            PayloadFieldSchema,
+        >::new()));
+
+        let mut proxies = Vec::new();
+        for sg in optimizing_segments.iter() {
+            let mut proxy = ProxySegment::new(
+                sg.clone(),
+                tmp_segment.clone(),
+                proxy_deleted_points.clone(),
+                proxy_created_indexes.clone(),
+                proxy_deleted_indexes.clone(),
+            );
+            // Wrapped segment is fresh, so it has no operations
+            // Operation with number 0 will be applied
+            proxy.replicate_field_indexes(0)?;
+            proxies.push(proxy);
+        }
+
+        // Save segment version once all payload indices have been converted
+        // If this ends up not being saved due to a crash, the segment will not be used
+        match &tmp_segment {
+            LockedSegment::Original(segment) => {
+                let segment_path = &segment.read().current_path;
+                SegmentVersion::save(segment_path)?;
+            }
+            LockedSegment::Proxy(_) => unreachable!(),
+        }
+
+        let proxy_ids: Vec<_> = {
+            // Exclusive lock for the segments operations.
+            let mut write_segments = RwLockUpgradableReadGuard::upgrade(segment_lock);
+            let mut proxy_ids = Vec::new();
+            for (mut proxy, idx) in proxies.into_iter().zip(ids.iter().cloned()) {
+                // replicate_field_indexes for the second time,
+                // because optimized segments could have been changed.
+                // The probability is small, though,
+                // so we can afford this operation under the full collection write lock
+                let op_num = 0;
+                proxy.replicate_field_indexes(op_num)?; // Slow only in case the index is change in the gap between two calls
+                proxy_ids.push(write_segments.swap(proxy, &[idx]).0);
+            }
+            proxy_ids
+        };
+
+        check_process_stopped(stopped).map_err(|error| {
+            self.handle_cancellation(&segments, &proxy_ids, &tmp_segment);
+            error
+        })?;
+
+        // ---- SLOW PART -----
+
+        let mut optimized_segment = match self.build_new_segment(
+            &optimizing_segments,
+            proxy_deleted_points.clone(),
+            proxy_deleted_indexes.clone(),
+            proxy_created_indexes.clone(),
+            permit,
+            stopped,
+        ) {
+            Ok(segment) => segment,
+            Err(error) => {
+                if matches!(error, CollectionError::Cancelled { .. }) {
+                    self.handle_cancellation(&segments, &proxy_ids, &tmp_segment);
+                }
+                return Err(error);
+            }
+        };
+
+        // Avoid unnecessary point removing in the critical section:
+        // - save already removed points while avoiding long read locks
+        // - exclude already removed points from post-optimization removing
+        let already_remove_points = {
+            let mut all_removed_points: HashSet<_> =
+                proxy_deleted_points.read().iter().cloned().collect();
+            for existing_point in optimized_segment.iter_points() {
+                all_removed_points.remove(&existing_point);
+            }
+            all_removed_points
+        };
+
+        // ---- SLOW PART ENDS HERE -----
+
+        check_process_stopped(stopped).map_err(|error| {
+            self.handle_cancellation(&segments, &proxy_ids, &tmp_segment);
+            error
+        })?;
+
+        {
+            // This block locks all operations with collection. It should be fast
+            let mut write_segments_guard = segments.write();
+            let deleted_points = proxy_deleted_points.read();
+            let points_diff = deleted_points.difference(&already_remove_points);
+            for &point_id in points_diff {
+                optimized_segment
+                    .delete_point(optimized_segment.version(), point_id)
+                    .unwrap();
+            }
+
+            for deleted_field_name in proxy_deleted_indexes.read().iter() {
+                optimized_segment
+                    .delete_field_index(optimized_segment.version(), deleted_field_name)?;
+            }
+
+            for (created_field_name, schema_type) in proxy_created_indexes.read().iter() {
+                optimized_segment.create_field_index(
+                    optimized_segment.version(),
+                    created_field_name,
+                    Some(schema_type),
+                )?;
+            }
+
+            optimized_segment.prefault_mmap_pages();
+
+            let (_, proxies) = write_segments_guard.swap(optimized_segment, &proxy_ids);
+
+            let has_appendable_segments =
+                write_segments_guard.random_appendable_segment().is_some();
+
+            // Release reference counter of the optimized segments
+            drop(optimizing_segments);
+
+            // Append a temp segment to a collection if it is not empty or there is no other appendable segment
+            if tmp_segment.get().read().available_point_count() > 0 || !has_appendable_segments {
+                write_segments_guard.add_locked(tmp_segment);
+
+                // unlock collection for search and updates
+                drop(write_segments_guard);
+                // After the collection is unlocked - we can remove data as slow as we want.
+
+                // Only remove data after we ensure the consistency of the collection.
+                // If remove fails - we will still have operational collection with reported error.
+                for proxy in proxies {
+                    proxy.drop_data()?;
+                }
+            } else {
+                // unlock collection for search and updates
+                drop(write_segments_guard);
+                // After the collection is unlocked - we can remove data as slow as we want.
+
+                // Proxy contains pointer to the `tmp_segment`, so they should be removed first
+                for proxy in proxies {
+                    proxy.drop_data()?;
+                }
+                tmp_segment.drop_data()?;
+            }
+        }
+        timer.set_success(true);
+        Ok(true)
+    }
+}
