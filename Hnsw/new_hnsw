@@ -1,0 +1,918 @@
+Here are all the files from both commits. I'll show the **new files in full** and the **modified files with just the changed sections**.
+
+---
+
+## COMMIT 1 FILES (from earlier session)
+
+### NEW FILE: `lib/segment/src/index/hnsw_index/graph_links_mut.rs`
+
+```rust
+use std::ops::Range;
+use std::path::Path;
+
+use common::types::PointOffsetType;
+use serde::{Deserialize, Serialize};
+
+use crate::common::operation_error::OperationResult;
+use crate::index::hnsw_index::graph_layers::LayersContainer;
+use crate::index::hnsw_index::graph_links::{GraphLinks, GraphLinksConverter};
+
+/// Mutable graph links implementation that supports incremental point
+/// addition and removal. Unlike `GraphLinksRam`/`GraphLinksMmap` which are
+/// immutable after construction, this stores links in a `Vec<Vec<Vec<PointOffsetType>>>`
+/// structure that can be modified in place.
+///
+/// The trade-off is higher memory usage and slower link access compared to
+/// the compacted immutable format, but it enables O(1) per-point mutations.
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+pub struct GraphLinksMut {
+    /// links_layers[point_id][level] = Vec<neighbor_point_ids>
+    links_layers: Vec<LayersContainer>,
+}
+
+impl GraphLinksMut {
+    /// Create a new mutable graph links structure with a given number of points.
+    /// All points start with a single empty level-0 link list.
+    pub fn new(num_points: usize) -> Self {
+        let links_layers = (0..num_points)
+            .map(|_| vec![Vec::new()])
+            .collect();
+        Self { links_layers }
+    }
+
+    /// Build from an existing layers container (e.g. from GraphLayersBuilder).
+    pub fn from_layers(links_layers: Vec<LayersContainer>) -> Self {
+        Self { links_layers }
+    }
+
+    /// Number of points in the graph.
+    pub fn num_points_mut(&self) -> usize {
+        self.links_layers.len()
+    }
+
+    /// Ensure the structure has at least `num_points` slots.
+    pub fn ensure_capacity(&mut self, num_points: usize) {
+        while self.links_layers.len() < num_points {
+            self.links_layers.push(vec![Vec::new()]);
+        }
+    }
+
+    /// Set levels for a point, allocating empty link lists as needed.
+    pub fn set_levels(&mut self, point_id: PointOffsetType, level: usize) {
+        let pid = point_id as usize;
+        self.ensure_capacity(pid + 1);
+        let point_layers = &mut self.links_layers[pid];
+        while point_layers.len() <= level {
+            point_layers.push(Vec::new());
+        }
+    }
+
+    /// Get the level of a point.
+    pub fn point_level_mut(&self, point_id: PointOffsetType) -> usize {
+        let pid = point_id as usize;
+        if pid < self.links_layers.len() && !self.links_layers[pid].is_empty() {
+            self.links_layers[pid].len() - 1
+        } else {
+            0
+        }
+    }
+
+    /// Get mutable access to a point's links at a given level.
+    pub fn links_mut(
+        &mut self,
+        point_id: PointOffsetType,
+        level: usize,
+    ) -> &mut Vec<PointOffsetType> {
+        &mut self.links_layers[point_id as usize][level]
+    }
+
+    /// Get read access to a point's links at a given level.
+    pub fn links_ref(&self, point_id: PointOffsetType, level: usize) -> &[PointOffsetType] {
+        let pid = point_id as usize;
+        if pid < self.links_layers.len() && level < self.links_layers[pid].len() {
+            &self.links_layers[pid][level]
+        } else {
+            &[]
+        }
+    }
+
+    /// Remove all links to/from a point. This clears the point's own link lists
+    /// and removes the point from all neighbor link lists.
+    pub fn remove_point(&mut self, point_id: PointOffsetType) {
+        let pid = point_id as usize;
+        if pid >= self.links_layers.len() {
+            return;
+        }
+
+        // Collect neighbors across all levels so we can remove back-links
+        let num_levels = self.links_layers[pid].len();
+        let mut neighbors_by_level: Vec<Vec<PointOffsetType>> = Vec::with_capacity(num_levels);
+        for level in 0..num_levels {
+            neighbors_by_level.push(self.links_layers[pid][level].clone());
+        }
+
+        // Clear this point's own links
+        for level in 0..num_levels {
+            self.links_layers[pid][level].clear();
+        }
+
+        // Remove back-links from all neighbors
+        for (level, neighbors) in neighbors_by_level.iter().enumerate() {
+            for &neighbor_id in neighbors {
+                let nid = neighbor_id as usize;
+                if nid < self.links_layers.len() && level < self.links_layers[nid].len() {
+                    self.links_layers[nid][level].retain(|&x| x != point_id);
+                }
+            }
+        }
+    }
+
+    /// Add a bidirectional link between two points at a given level.
+    pub fn add_link(
+        &mut self,
+        point_a: PointOffsetType,
+        point_b: PointOffsetType,
+        level: usize,
+    ) {
+        let a = point_a as usize;
+        let b = point_b as usize;
+
+        if a < self.links_layers.len()
+            && level < self.links_layers[a].len()
+            && !self.links_layers[a][level].contains(&point_b)
+        {
+            self.links_layers[a][level].push(point_b);
+        }
+
+        if b < self.links_layers.len()
+            && level < self.links_layers[b].len()
+            && !self.links_layers[b][level].contains(&point_a)
+        {
+            self.links_layers[b][level].push(point_a);
+        }
+    }
+
+    /// Convert to a `GraphLinksConverter` for serialization or conversion to
+    /// immutable `GraphLinks`.
+    pub fn into_converter(self) -> GraphLinksConverter {
+        GraphLinksConverter::new(self.links_layers)
+    }
+
+    /// Convert into an immutable `GraphLinks` implementation.
+    pub fn into_graph_links<TGraphLinks: GraphLinks>(
+        self,
+        path: Option<&Path>,
+    ) -> OperationResult<TGraphLinks> {
+        let mut converter = self.into_converter();
+        if let Some(path) = path {
+            converter.save_as(path)?;
+        }
+        TGraphLinks::from_converter(converter)
+    }
+
+    /// Get the underlying layers for read access.
+    pub fn layers(&self) -> &Vec<LayersContainer> {
+        &self.links_layers
+    }
+}
+```
+
+---
+
+### NEW FILE: `lib/segment/src/index/hnsw_index/incremental.rs`
+
+```rust
+use std::fs::create_dir_all;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use atomic_refcell::AtomicRefCell;
+use common::cpu::CpuPermit;
+use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
+use log::debug;
+use rand::thread_rng;
+
+use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
+use crate::data_types::vectors::{QueryVector, VectorRef};
+use crate::id_tracker::{IdTracker, IdTrackerSS};
+use crate::index::hnsw_index::config::HnswGraphConfig;
+use crate::index::hnsw_index::graph_layers::GraphLayers;
+use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
+use crate::index::hnsw_index::graph_links::{GraphLinks, GraphLinksRam};
+use crate::index::hnsw_index::hnsw::{HNSWIndex, HNSW_USE_HEURISTIC};
+use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::struct_payload_index::StructPayloadIndex;
+use crate::index::VectorIndex;
+use crate::telemetry::VectorIndexSearchesTelemetry;
+use crate::types::{Filter, SearchParams};
+use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+
+pub const INCREMENTAL_BUILDER_STATE_FILE: &str = "incremental_builder.bin";
+
+/// Threshold: when the number of pending incremental changes exceeds this
+/// fraction of the total indexed points, trigger a full rebuild.
+const REBUILD_FRACTION_THRESHOLD: f64 = 0.3;
+
+/// IncrementalHnswIndex wraps an HNSWIndex and maintains a mutable
+/// GraphLayersBuilder to support incremental point insertion and removal
+/// without requiring a full graph rebuild for every change.
+///
+/// Architecture:
+/// - The underlying `HNSWIndex` holds the immutable base graph for efficient search
+/// - A `GraphLayersBuilder` (the "incremental builder") tracks points added/removed
+///   since the last full build
+/// - On search, we query the base graph (new points added incrementally are
+///   visible after the next compaction)
+/// - When the number of incremental changes exceeds a threshold, we trigger
+///   a full rebuild that incorporates all changes
+///
+/// This enables O(log n) point insertions instead of O(n log n) full rebuilds.
+pub struct IncrementalHnswIndex<TGraphLinks: GraphLinks> {
+    /// The underlying HNSW index (immutable base graph + search)
+    base_index: HNSWIndex<TGraphLinks>,
+
+    /// Mutable builder for incremental operations. `None` until the first
+    /// incremental operation or until loaded from a saved state.
+    incremental_builder: Option<GraphLayersBuilder>,
+
+    /// Number of incremental additions since last full build
+    additions_since_rebuild: usize,
+
+    /// Number of incremental removals since last full build
+    removals_since_rebuild: usize,
+
+    /// Points that have been removed since last rebuild.
+    /// These are filtered out during search.
+    removed_points: Vec<PointOffsetType>,
+
+    /// Path for persisting the incremental builder state
+    path: PathBuf,
+}
+
+impl<TGraphLinks: GraphLinks> IncrementalHnswIndex<TGraphLinks> {
+    /// Open or create an IncrementalHnswIndex.
+    pub fn open(
+        path: &Path,
+        id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+        vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
+        quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
+        payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
+        hnsw_config: crate::types::HnswConfig,
+    ) -> OperationResult<Self> {
+        create_dir_all(path)?;
+
+        let base_index = HNSWIndex::open(
+            path,
+            id_tracker,
+            vector_storage,
+            quantized_vectors,
+            payload_index,
+            hnsw_config,
+        )?;
+
+        // Try to load incremental builder state
+        let builder_path = Self::builder_state_path(path);
+        let incremental_builder = if builder_path.exists() {
+            match GraphLayersBuilder::load_state(&builder_path) {
+                Ok(builder) => {
+                    debug!("Loaded incremental HNSW builder state from {:?}", builder_path);
+                    Some(builder)
+                }
+                Err(e) => {
+                    debug!("Failed to load incremental builder state: {}, starting fresh", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            base_index,
+            incremental_builder,
+            additions_since_rebuild: 0,
+            removals_since_rebuild: 0,
+            removed_points: Vec::new(),
+            path: path.to_owned(),
+        })
+    }
+
+    fn builder_state_path(path: &Path) -> PathBuf {
+        path.join(INCREMENTAL_BUILDER_STATE_FILE)
+    }
+
+    /// Initialize the incremental builder from the base index if not already present.
+    fn ensure_builder(&mut self) -> &mut GraphLayersBuilder {
+        if self.incremental_builder.is_none() {
+            let config = self.base_index.config();
+            let vector_storage = self.base_index.vector_storage();
+            let total = vector_storage.borrow().total_vector_count();
+
+            let builder = GraphLayersBuilder::new(
+                total,
+                config.m,
+                config.m0,
+                config.ef_construct,
+                1, // entry_points_num
+                HNSW_USE_HEURISTIC,
+            );
+            self.incremental_builder = Some(builder);
+        }
+        self.incremental_builder.as_mut().unwrap()
+    }
+
+    /// Check if we should do a full rebuild based on the number of changes.
+    fn should_rebuild(&self) -> bool {
+        let total_indexed = self.base_index.indexed_vector_count();
+        if total_indexed == 0 {
+            return self.additions_since_rebuild > 0;
+        }
+        let total_changes = self.additions_since_rebuild + self.removals_since_rebuild;
+        (total_changes as f64 / total_indexed as f64) > REBUILD_FRACTION_THRESHOLD
+    }
+
+    /// Add a single point incrementally to the HNSW graph.
+    pub fn add_point(
+        &mut self,
+        point_id: PointOffsetType,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        check_process_stopped(stopped)?;
+
+        // Ensure builder exists first (needs &mut self)
+        self.ensure_builder();
+
+        // Clone Arcs so we don't hold a borrow on self
+        let vector_storage = self.base_index.vector_storage().clone();
+        let id_tracker = self.base_index.id_tracker().clone();
+        let quantized_vectors = self.base_index.get_quantized_vectors();
+
+        let vs_borrow = vector_storage.borrow();
+        let id_t_borrow = id_tracker.borrow();
+        let qv_borrow = quantized_vectors.borrow();
+
+        let vector = vs_borrow.get_vector(point_id);
+        let vector = vector.as_vec_ref().into();
+
+        let raw_scorer = if let Some(quantized_storage) = qv_borrow.as_ref() {
+            quantized_storage.raw_scorer(
+                vector,
+                id_t_borrow.deleted_point_bitslice(),
+                vs_borrow.deleted_vector_bitslice(),
+                stopped,
+            )
+        } else {
+            new_raw_scorer(vector, &vs_borrow, id_t_borrow.deleted_point_bitslice())
+        }?;
+
+        let points_scorer = FilteredScorer::new(raw_scorer.as_ref(), None);
+
+        let mut rng = thread_rng();
+        let builder = self.incremental_builder.as_mut().unwrap();
+        let level = builder.get_random_layer(&mut rng);
+        builder.add_new_point(point_id, level, points_scorer);
+
+        self.additions_since_rebuild += 1;
+
+        // Remove from removed list if it was previously removed
+        self.removed_points.retain(|&p| p != point_id);
+
+        Ok(())
+    }
+
+    /// Remove a single point from the HNSW graph incrementally.
+    pub fn remove_point(&mut self, point_id: PointOffsetType) -> OperationResult<()> {
+        if let Some(builder) = &mut self.incremental_builder {
+            builder.remove_point(point_id);
+        }
+
+        if !self.removed_points.contains(&point_id) {
+            self.removed_points.push(point_id);
+        }
+
+        self.removals_since_rebuild += 1;
+        Ok(())
+    }
+
+    /// Save the current incremental builder state to disk.
+    pub fn save_incremental_state(&self) -> OperationResult<()> {
+        if let Some(builder) = &self.incremental_builder {
+            let state_path = Self::builder_state_path(&self.path);
+            builder.save_state(&state_path)?;
+            debug!("Saved incremental HNSW builder state to {:?}", state_path);
+        }
+        Ok(())
+    }
+
+    /// Get the total number of indexed points (base + incremental additions - removals).
+    pub fn total_indexed_count(&self) -> usize {
+        let base = self.base_index.indexed_vector_count();
+        base + self.additions_since_rebuild - self.removals_since_rebuild.min(base)
+    }
+
+    /// Get the number of pending incremental changes.
+    pub fn pending_changes(&self) -> usize {
+        self.additions_since_rebuild + self.removals_since_rebuild
+    }
+
+    /// Access the underlying base index.
+    pub fn base_index(&self) -> &HNSWIndex<TGraphLinks> {
+        &self.base_index
+    }
+
+    /// Access the underlying base index mutably (for full rebuild).
+    pub fn base_index_mut(&mut self) -> &mut HNSWIndex<TGraphLinks> {
+        &mut self.base_index
+    }
+
+    /// Perform a full rebuild, incorporating all incremental changes.
+    /// After rebuild, the incremental builder is cleared.
+    pub fn full_rebuild(
+        &mut self,
+        permit: Arc<CpuPermit>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        debug!(
+            "Performing full HNSW rebuild ({} additions, {} removals pending)",
+            self.additions_since_rebuild, self.removals_since_rebuild
+        );
+
+        self.base_index.build_index(permit, stopped)?;
+
+        // Clear incremental state
+        self.incremental_builder = None;
+        self.additions_since_rebuild = 0;
+        self.removals_since_rebuild = 0;
+        self.removed_points.clear();
+
+        // Remove saved state file
+        let state_path = Self::builder_state_path(&self.path);
+        if state_path.exists() {
+            std::fs::remove_file(&state_path).ok();
+        }
+
+        Ok(())
+    }
+
+    /// Build the index, either incrementally or full depending on the state.
+    pub fn build_index_incremental(
+        &mut self,
+        permit: Arc<CpuPermit>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        if self.should_rebuild() || self.base_index.indexed_vector_count() == 0 {
+            self.full_rebuild(permit, stopped)
+        } else {
+            // Save incremental state only
+            self.save_incremental_state()
+        }
+    }
+}
+
+impl<TGraphLinks: GraphLinks> VectorIndex for IncrementalHnswIndex<TGraphLinks> {
+    fn search(
+        &self,
+        vectors: &[&QueryVector],
+        filter: Option<&Filter>,
+        top: usize,
+        params: Option<&SearchParams>,
+        is_stopped: &AtomicBool,
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        // Delegate to base index search - removed points are already handled
+        // by the id_tracker's deleted bitslice
+        self.base_index.search(vectors, filter, top, params, is_stopped)
+    }
+
+    fn build_index(
+        &mut self,
+        permit: Arc<CpuPermit>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        self.build_index_incremental(permit, stopped)
+    }
+
+    fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
+        self.base_index.get_telemetry_data(detail)
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        let mut files = self.base_index.files();
+        let state_path = Self::builder_state_path(&self.path);
+        if state_path.exists() {
+            files.push(state_path);
+        }
+        files
+    }
+
+    fn indexed_vector_count(&self) -> usize {
+        self.total_indexed_count()
+    }
+
+    fn update_vector(
+        &mut self,
+        id: PointOffsetType,
+        _vector: VectorRef,
+    ) -> OperationResult<()> {
+        // For HNSW, updating a vector means removing the old point and
+        // re-inserting with the new vector. The vector storage is already
+        // updated by the caller, so we just need to re-link in the graph.
+        let stopped = AtomicBool::new(false);
+
+        // Remove old links
+        self.remove_point(id)?;
+
+        // Re-insert with updated vector
+        self.add_point(id, &stopped)?;
+
+        Ok(())
+    }
+}
+```
+
+---
+
+### MODIFIED: `lib/segment/src/index/hnsw_index/mod.rs`
+
+Add after `pub mod graph_links;`:
+```rust
+pub mod graph_links_mut;
+pub mod incremental;
+```
+
+---
+
+### MODIFIED: `lib/segment/src/index/hnsw_index/hnsw.rs`
+
+**Change 1** - make constant public:
+```rust
+pub const HNSW_USE_HEURISTIC: bool = true;
+```
+
+**Change 2** - add accessors inside `impl<TGraphLinks: GraphLinks> HNSWIndex<TGraphLinks>`:
+```rust
+    pub fn config(&self) -> &HnswGraphConfig {
+        &self.config
+    }
+
+    pub fn vector_storage(&self) -> &Arc<AtomicRefCell<VectorStorageEnum>> {
+        &self.vector_storage
+    }
+
+    pub fn id_tracker(&self) -> &Arc<AtomicRefCell<IdTrackerSS>> {
+        &self.id_tracker
+    }
+
+    pub fn payload_index(&self) -> &Arc<AtomicRefCell<StructPayloadIndex>> {
+        &self.payload_index
+    }
+```
+
+---
+
+### MODIFIED: `lib/segment/src/index/hnsw_index/entry_points.rs`
+
+Add inside `impl EntryPoints`, before `get_entry_point`:
+```rust
+    pub fn remove_point(&mut self, point_id: PointOffsetType) {
+        self.entry_points.retain(|ep| ep.point_id != point_id);
+        let old_extra: Vec<_> = self.extra_entry_points.iter().cloned().collect();
+        let capacity = self.extra_entry_points.len().max(old_extra.len());
+        self.extra_entry_points = FixedLengthPriorityQueue::new(capacity);
+        for ep in old_extra {
+            if ep.point_id != point_id {
+                self.extra_entry_points.push(ep);
+            }
+        }
+    }
+```
+
+---
+
+### MODIFIED: `lib/segment/src/index/hnsw_index/graph_layers_builder.rs`
+
+**Change 1** - add imports:
+```rust
+use io::file_operations::{atomic_save_bin, read_bin};
+use serde::{Deserialize, Serialize};
+```
+
+**Change 2** - add at end of `impl GraphLayersBuilder` block:
+```rust
+    // ---- Incremental indexing methods ----
+
+    pub fn ensure_point_capacity(&self, point_id: PointOffsetType) -> bool {
+        false
+    }
+
+    pub fn expand_to_fit(&mut self, new_size: usize) {
+        while self.links_layers.len() < new_size {
+            self.links_layers.push(vec![RwLock::new(Vec::with_capacity(self.m0))]);
+        }
+        let mut ready = self.ready_list.write();
+        ready.resize(new_size, false);
+    }
+
+    pub fn add_new_point(
+        &mut self,
+        point_id: PointOffsetType,
+        level: usize,
+        points_scorer: FilteredScorer,
+    ) {
+        let pid = point_id as usize;
+        self.expand_to_fit(pid + 1);
+        self.set_levels(point_id, level);
+        self.link_new_point(point_id, points_scorer);
+    }
+
+    pub fn remove_point(&mut self, point_id: PointOffsetType) {
+        let pid = point_id as usize;
+        if pid >= self.links_layers.len() {
+            return;
+        }
+        let num_levels = self.links_layers[pid].len();
+        let mut neighbors_by_level: Vec<Vec<PointOffsetType>> = Vec::with_capacity(num_levels);
+        for level in 0..num_levels {
+            let links = self.links_layers[pid][level].read();
+            neighbors_by_level.push(links.clone());
+        }
+        for level in 0..num_levels {
+            self.links_layers[pid][level].write().clear();
+        }
+        for (level, neighbors) in neighbors_by_level.iter().enumerate() {
+            for &neighbor_id in neighbors {
+                let nid = neighbor_id as usize;
+                if nid < self.links_layers.len() && level < self.links_layers[nid].len() {
+                    let mut neighbor_links = self.links_layers[nid][level].write();
+                    neighbor_links.retain(|&x| x != point_id);
+                }
+            }
+        }
+        self.ready_list.write().set(pid, false);
+        {
+            let mut entry_points = self.entry_points.lock();
+            entry_points.remove_point(point_id);
+        }
+    }
+
+    pub fn is_point_ready(&self, point_id: PointOffsetType) -> bool {
+        let pid = point_id as usize;
+        let ready = self.ready_list.read();
+        pid < ready.len() && ready[pid]
+    }
+
+    pub fn indexed_count(&self) -> usize {
+        self.ready_list.read().count_ones()
+    }
+
+    pub fn get_params(&self) -> (usize, usize, usize, bool) {
+        (self.m, self.m0, self.ef_construct, self.use_heuristic)
+    }
+```
+
+**Change 3** - add after `impl GraphLayersBuilder` closing `}`, before `#[cfg(test)]`:
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct GraphLayersBuilderState {
+    pub max_level: usize,
+    pub m: usize,
+    pub m0: usize,
+    pub ef_construct: usize,
+    pub level_factor: f64,
+    pub use_heuristic: bool,
+    pub links_layers: Vec<Vec<Vec<PointOffsetType>>>,
+    pub entry_points: EntryPoints,
+    pub ready_list: Vec<bool>,
+}
+
+impl GraphLayersBuilder {
+    pub fn save_state(&self, path: &Path) -> OperationResult<()> {
+        let links: Vec<Vec<Vec<PointOffsetType>>> = self
+            .links_layers
+            .iter()
+            .map(|layers| layers.iter().map(|l| l.read().clone()).collect())
+            .collect();
+        let ready: Vec<bool> = {
+            let r = self.ready_list.read();
+            r.iter().map(|b| *b).collect()
+        };
+        let state = GraphLayersBuilderState {
+            max_level: self.max_level.load(std::sync::atomic::Ordering::Relaxed),
+            m: self.m,
+            m0: self.m0,
+            ef_construct: self.ef_construct,
+            level_factor: self.level_factor,
+            use_heuristic: self.use_heuristic,
+            links_layers: links,
+            entry_points: self.entry_points.lock().clone(),
+            ready_list: ready,
+        };
+        Ok(atomic_save_bin(path, &state)?)
+    }
+
+    pub fn load_state(path: &Path) -> OperationResult<Self> {
+        let state: GraphLayersBuilderState = read_bin(path)?;
+        let links_layers: Vec<LockedLayersContainer> = state
+            .links_layers
+            .into_iter()
+            .map(|layers| layers.into_iter().map(|l| RwLock::new(l)).collect())
+            .collect();
+        let ready_bits: BitVec = state.ready_list.into_iter().collect();
+        Ok(Self {
+            max_level: AtomicUsize::new(state.max_level),
+            m: state.m,
+            m0: state.m0,
+            ef_construct: state.ef_construct,
+            level_factor: state.level_factor,
+            use_heuristic: state.use_heuristic,
+            links_layers,
+            entry_points: Mutex::new(state.entry_points),
+            visited_pool: VisitedPool::new(),
+            ready_list: RwLock::new(ready_bits),
+        })
+    }
+}
+```
+
+---
+
+### MODIFIED: `lib/segment/src/index/vector_index_base.rs`
+
+**Change 1** - add import:
+```rust
+use super::hnsw_index::incremental::IncrementalHnswIndex;
+```
+
+**Change 2** - add to `VectorIndex` trait after `update_vector`:
+```rust
+    fn add_point_incremental(
+        &mut self,
+        _id: PointOffsetType,
+        _is_stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        Ok(())
+    }
+
+    fn remove_point_incremental(
+        &mut self,
+        _id: PointOffsetType,
+    ) -> OperationResult<()> {
+        Ok(())
+    }
+```
+
+**Change 3** - add variants to `VectorIndexEnum`:
+```rust
+    IncrementalHnswRam(IncrementalHnswIndex<GraphLinksRam>),
+    IncrementalHnswMmap(IncrementalHnswIndex<GraphLinksMmap>),
+```
+
+**Change 4** - add match arms in `is_index()`:
+```rust
+            Self::IncrementalHnswRam(_) => true,
+            Self::IncrementalHnswMmap(_) => true,
+```
+
+**Change 5** - add match arms in every `VectorIndex` method (`search`, `build_index`, `get_telemetry_data`, `files`, `indexed_vector_count`, `update_vector`):
+```rust
+            VectorIndexEnum::IncrementalHnswRam(index) => /* same call pattern */,
+            VectorIndexEnum::IncrementalHnswMmap(index) => /* same call pattern */,
+```
+
+**Change 6** - add new method impls:
+```rust
+    fn add_point_incremental(
+        &mut self,
+        id: PointOffsetType,
+        is_stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        match self {
+            Self::IncrementalHnswRam(index) => index.add_point(id, is_stopped),
+            Self::IncrementalHnswMmap(index) => index.add_point(id, is_stopped),
+            _ => Ok(()),
+        }
+    }
+
+    fn remove_point_incremental(
+        &mut self,
+        id: PointOffsetType,
+    ) -> OperationResult<()> {
+        match self {
+            Self::IncrementalHnswRam(index) => index.remove_point(id),
+            Self::IncrementalHnswMmap(index) => index.remove_point(id),
+            _ => Ok(()),
+        }
+    }
+```
+
+---
+
+## COMMIT 2 FILES (optimizer integration)
+
+### MODIFIED: `lib/segment/src/types.rs`
+
+**Change 1** - add field to `HnswConfig` struct:
+```rust
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental: Option<bool>,
+```
+
+**Change 2** - add to `Default for HnswConfig`:
+```rust
+            incremental: None,
+```
+
+**Change 3** - update `VectorDataConfig::is_appendable()`:
+```rust
+    pub fn is_appendable(&self) -> bool {
+        let is_index_appendable = match &self.index {
+            Indexes::Plain {} => true,
+            Indexes::Hnsw(hnsw_config) => {
+                hnsw_config.incremental == Some(true)
+            }
+        };
+        // ... rest unchanged
+    }
+```
+
+---
+
+### MODIFIED: `lib/segment/src/segment_constructor/segment_constructor_base.rs`
+
+**Change 1** - add import:
+```rust
+use crate::index::hnsw_index::incremental::IncrementalHnswIndex;
+```
+
+**Change 2** - replace HNSW index construction:
+```rust
+            Indexes::Hnsw(vector_hnsw_config) => sp(if vector_hnsw_config.incremental == Some(true) {
+                if vector_hnsw_config.on_disk == Some(true) {
+                    VectorIndexEnum::IncrementalHnswMmap(IncrementalHnswIndex::<GraphLinksMmap>::open(
+                        &vector_index_path,
+                        id_tracker.clone(),
+                        vector_storage.clone(),
+                        quantized_vectors.clone(),
+                        payload_index.clone(),
+                        vector_hnsw_config.clone(),
+                    )?)
+                } else {
+                    VectorIndexEnum::IncrementalHnswRam(IncrementalHnswIndex::<GraphLinksRam>::open(
+                        &vector_index_path,
+                        id_tracker.clone(),
+                        vector_storage.clone(),
+                        quantized_vectors.clone(),
+                        payload_index.clone(),
+                        vector_hnsw_config.clone(),
+                    )?)
+                }
+            } else if vector_hnsw_config.on_disk == Some(true) {
+                VectorIndexEnum::HnswMmap(HNSWIndex::<GraphLinksMmap>::open( /* ... unchanged ... */ )?)
+            } else {
+                VectorIndexEnum::HnswRam(HNSWIndex::<GraphLinksRam>::open( /* ... unchanged ... */ )?)
+            }),
+```
+
+---
+
+### MODIFIED: `lib/segment/src/segment.rs`
+
+Add in `delete_point()`, after the commented-out vector deletion block:
+```rust
+                    // Notify incremental HNSW indexes about the deletion so they can
+                    // unlink the point from the graph. This is safe because it only
+                    // affects the graph structure, not the vector storage data.
+                    for vector_data in segment.vector_data.values() {
+                        vector_data
+                            .vector_index
+                            .borrow_mut()
+                            .remove_point_incremental(internal_id)?;
+                    }
+```
+
+---
+
+### MODIFIED: `lib/segment/src/compat.rs`
+
+Add `incremental: None,` to all 3 `HnswConfig` literals.
+
+---
+
+### MODIFIED: All test files + grpc conversions
+
+Add `incremental: None,` to every `HnswConfig { ... }` literal in:
+- `lib/segment/src/index/hnsw_index/tests/test_graph_connectivity.rs`
+- `lib/segment/tests/integration/batch_search_test.rs`
+- `lib/segment/tests/integration/exact_search_test.rs`
+- `lib/segment/tests/integration/filtrable_hnsw_test.rs`
+- `lib/segment/tests/integration/hnsw_discover_test.rs` (2 places)
+- `lib/segment/tests/integration/hnsw_quantized_search_test.rs` (2 places)
+- `lib/collection/src/collection_manager/optimizers/config_mismatch_optimizer.rs` (2 places)
+- `lib/collection/src/collection_manager/optimizers/vacuum_optimizer.rs`
+- `lib/collection/src/collection_manager/optimizers/indexing_optimizer.rs`
+- `lib/api/src/grpc/conversions.rs`
+
+---
+
+### NEW FILE: `INCREMENTAL_HNSW_README.md`
